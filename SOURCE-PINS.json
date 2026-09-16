@@ -1,0 +1,11 @@
+{
+  "app_repository": "LiuLin1220/hiddify-app",
+  "app_sha": "72c1a3d8a2e7c6d10be99e84b02982da68809526",
+  "core_repository": "hiddify/hiddify-core",
+  "core_sha": "db74dfc257d5becb4b4e9dbc7257a3dcdde20692",
+  "flutter_version": "3.38.5",
+  "purpose": [
+    "Windows restore previous connection on startup",
+    "fixed HiddifyCli tunnel service address / tunnel activate path"
+  ]
+}
