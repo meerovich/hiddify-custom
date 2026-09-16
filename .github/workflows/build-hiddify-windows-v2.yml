@@ -1,0 +1,376 @@
+name: Build Hiddify Windows - safe auto-connect + CLI tunnel fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # PR #2321 head commit: Windows previous-session restore/autoconnect.
+  APP_REPOSITORY: LiuLin1220/hiddify-app
+  APP_SHA: e0dfe9d9e3bb2dd95b916ec7d3d9313f0b1abcb1
+
+  # Exact official hiddify-core v4.1.0 release commit used by Hiddify 4.1.1.
+  CORE_REPOSITORY: hiddify/hiddify-core
+  CORE_SHA: c9d6f0f00b2eda34e4fb71863e4e0a62b3e931a0
+  CORE_VERSION: "4.1.0"
+
+  FLUTTER_VERSION: "3.38.5"
+
+  # CRITICAL: prod forces the app Makefile to download the pinned/released
+  # v4.1.0 core instead of the moving "draft" core.
+  CHANNEL: prod
+  IS_GITHUB_ACTIONS: "1"
+
+jobs:
+  test-app:
+    name: Test app autoconnect patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact app PR commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ env.APP_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify app revision and pinned core version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APP_SHA"
+          grep -Fx "core.version=$CORE_VERSION" dependencies.properties
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@fd55f4c5af5b953cc57a2be44cb082c8f6635e8e
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Prepare and run app tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          make common-prepare
+          flutter test --no-pub
+
+  build-patched-cli:
+    name: Build ONLY patched HiddifyCli.exe from official core v4.1.0 source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact official core v4.1.0 source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_SHA }}
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify exact core revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CORE_SHA"
+
+      - name: Prove the v4.1.0 CLI regression exists before patching
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t matches < <(grep -R -l -F 'fmt.Sprint("127.0.0.1:%d", tunnelServicePort)' --include='*.go' .)
+          printf 'Found old buggy expression in:\n%s\n' "${matches[@]}"
+          test "${#matches[@]}" -eq 1
+
+      - name: Apply ONLY Sprint -> Sprintf fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          old = 'fmt.Sprint("127.0.0.1:%d", tunnelServicePort)'
+          new = 'fmt.Sprintf("127.0.0.1:%d", tunnelServicePort)'
+
+          matches = []
+          for p in Path(".").rglob("*.go"):
+              try:
+                  text = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              if old in text:
+                  matches.append((p, text.count(old)))
+
+          if len(matches) != 1 or matches[0][1] != 1:
+              raise SystemExit(f"Expected exactly one buggy occurrence, got: {matches}")
+
+          p, _ = matches[0]
+          text = p.read_text(encoding="utf-8")
+          p.write_text(text.replace(old, new, 1), encoding="utf-8")
+          print(f"Patched: {p}")
+          PY
+
+          if grep -R -F 'fmt.Sprint("127.0.0.1:%d", tunnelServicePort)' --include='*.go' .; then
+            echo "Old buggy expression still present"
+            exit 1
+          fi
+
+          grep -R -n -F 'fmt.Sprintf("127.0.0.1:%d", tunnelServicePort)' --include='*.go' .
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          check-latest: false
+          cache: true
+
+      - name: Setup MinGW cross compiler
+        uses: egor-tensin/setup-mingw@84c781b557efd538dec66bde06988d81cd3138cf
+        with:
+          platform: x64
+
+      - name: Build v4.1.0 Windows core/CLI, retain ONLY patched CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          make windows-amd64
+          test -s bin/HiddifyCli.exe
+          sha256sum bin/HiddifyCli.exe
+
+          cat > bin/PATCHED-CLI-PROVENANCE.txt <<EOF
+          core_repository=$CORE_REPOSITORY
+          core_sha=$CORE_SHA
+          core_version=$CORE_VERSION
+          patch=fmt.Sprint("127.0.0.1:%d", tunnelServicePort) -> fmt.Sprintf("127.0.0.1:%d", tunnelServicePort)
+          IMPORTANT=Only HiddifyCli.exe from this build is injected into the app. The app's hiddify-core.dll and libcronet.dll come from the official v4.1.0 release.
+          EOF
+
+      - name: Upload patched CLI only
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: patched-v4.1.0-cli
+          path: |
+            bin/HiddifyCli.exe
+            bin/PATCHED-CLI-PROVENANCE.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows using OFFICIAL v4.1.0 core DLL
+    needs: [test-app, build-patched-cli]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact app PR commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ env.APP_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify app revision and production core pin
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:APP_SHA) { throw "Unexpected app SHA: $actual" }
+
+          $deps = Get-Content dependencies.properties -Raw
+          if ($deps.Trim() -ne "core.version=$env:CORE_VERSION") {
+            throw "Unexpected dependencies.properties: $deps"
+          }
+
+          if ($env:CHANNEL -ne "prod") {
+            throw "CHANNEL must be prod, got $env:CHANNEL"
+          }
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@fd55f4c5af5b953cc57a2be44cb082c8f6635e8e
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          make windows-install-deps
+          "$HOME/.pub-cache/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prepare app
+        shell: pwsh
+        run: make common-prepare
+
+      - name: Download OFFICIAL released core v4.1.0 using app's production Makefile path
+        shell: pwsh
+        run: |
+          # With CHANNEL=prod this resolves to:
+          # https://github.com/hiddify/hiddify-core/releases/download/v4.1.0/
+          make windows-prepare
+
+          foreach ($file in @(
+            "hiddify-core/bin/hiddify-core.dll",
+            "hiddify-core/bin/HiddifyCli.exe",
+            "hiddify-core/bin/libcronet.dll"
+          )) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Official v4.1.0 package missing $file"
+            }
+          }
+
+          New-Item -ItemType Directory -Path provenance -Force | Out-Null
+          Get-FileHash hiddify-core/bin/hiddify-core.dll -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content provenance/OFFICIAL-CORE-DLL-SHA256.txt
+          Get-FileHash hiddify-core/bin/libcronet.dll -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content provenance/OFFICIAL-LIBCRONET-SHA256.txt
+          Get-FileHash hiddify-core/bin/HiddifyCli.exe -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content provenance/ORIGINAL-OFFICIAL-CLI-SHA256.txt
+
+      - name: Download patched CLI artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: patched-v4.1.0-cli
+          path: patched-cli
+
+      - name: Replace ONLY HiddifyCli.exe
+        shell: pwsh
+        run: |
+          $patched = Get-ChildItem patched-cli -Recurse -File -Filter "HiddifyCli.exe"
+          if ($patched.Count -ne 1) {
+            throw "Expected exactly one patched HiddifyCli.exe, found $($patched.Count)"
+          }
+
+          # Deliberately leave hiddify-core.dll and libcronet.dll untouched.
+          Copy-Item $patched[0].FullName hiddify-core/bin/HiddifyCli.exe -Force
+
+          $prov = Get-ChildItem patched-cli -Recurse -File -Filter "PATCHED-CLI-PROVENANCE.txt"
+          if ($prov.Count -eq 1) {
+            Copy-Item $prov[0].FullName provenance/PATCHED-CLI-PROVENANCE.txt -Force
+          }
+
+          Get-FileHash hiddify-core/bin/HiddifyCli.exe -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content provenance/PATCHED-CLI-SHA256.txt
+
+      - name: Smoke-test patched CLI against official DLL
+        shell: pwsh
+        run: |
+          Push-Location hiddify-core/bin
+          try {
+            .\HiddifyCli.exe --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patched CLI failed to start against official core DLL"
+            }
+            .\HiddifyCli.exe tunnel --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patched CLI tunnel command failed to load"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Build unsigned Windows packages
+        shell: pwsh
+        env:
+          SENTRY_DSN: ""
+        run: |
+          make windows-zip-release
+          make windows-exe-release
+
+      - name: Normalize and verify portable ZIP
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zips = @(Get-ChildItem dist -Recurse -File -Filter "*.zip")
+          if ($zips.Count -ne 1) { throw "Expected one ZIP, found $($zips.Count)" }
+          $zip = $zips[0].FullName
+
+          $valid = $false
+          $opened = $null
+          try {
+            $opened = [System.IO.Compression.ZipFile]::OpenRead($zip)
+            $valid = $opened.Entries.Count -gt 0
+          }
+          catch {
+            Write-Host "Portable output is not a normal ZIP; repacking."
+          }
+          finally {
+            if ($null -ne $opened) { $opened.Dispose() }
+          }
+
+          if (-not $valid) {
+            $tmp = Join-Path $env:RUNNER_TEMP "hiddify-portable"
+            $newZip = Join-Path $env:RUNNER_TEMP "hiddify-portable.zip"
+            New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+            & tar.exe -xf $zip -C $tmp
+            if ($LASTEXITCODE -ne 0) { throw "Could not unpack portable payload" }
+            if (-not (Test-Path (Join-Path $tmp "Hiddify") -PathType Container)) {
+              throw "Portable payload has no Hiddify directory"
+            }
+            if (Test-Path $newZip) { Remove-Item $newZip -Force }
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($tmp, $newZip)
+            Copy-Item $newZip $zip -Force
+          }
+
+          $check = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $names = @($check.Entries | ForEach-Object FullName)
+            foreach ($required in @(
+              "Hiddify/Hiddify.exe",
+              "Hiddify/hiddify-core.dll",
+              "Hiddify/HiddifyCli.exe",
+              "Hiddify/libcronet.dll"
+            )) {
+              if ($names -notcontains $required) { throw "ZIP missing $required" }
+            }
+          }
+          finally {
+            $check.Dispose()
+          }
+
+      - name: Stage outputs and provenance
+        shell: pwsh
+        run: |
+          $zips = @(Get-ChildItem dist -Recurse -File -Filter "*.zip")
+          $exes = @(Get-ChildItem dist -Recurse -File -Filter "*.exe")
+          if ($zips.Count -ne 1) { throw "Expected one ZIP, found $($zips.Count)" }
+          if ($exes.Count -ne 1) { throw "Expected one installer EXE, found $($exes.Count)" }
+
+          New-Item out -ItemType Directory -Force | Out-Null
+          Copy-Item $zips[0].FullName out/Hiddify-Windows-Portable-x64.zip
+          Copy-Item $exes[0].FullName out/Hiddify-Windows-Setup-x64.exe
+          Copy-Item provenance/* out/
+
+          @"
+          app_repository=$env:APP_REPOSITORY
+          app_sha=$env:APP_SHA
+          auto_connect_patch=PR #2321
+          official_core_repository=$env:CORE_REPOSITORY
+          official_core_sha=$env:CORE_SHA
+          official_core_version=$env:CORE_VERSION
+          core_dll=OFFICIAL v4.1.0 release, not rebuilt
+          libcronet_dll=OFFICIAL v4.1.0 release, not rebuilt
+          cli=rebuilt from exact v4.1.0 source with ONLY Sprint->Sprintf tunnel-address patch
+          channel=prod
+          flutter_version=$env:FLUTTER_VERSION
+          signing=unsigned
+          run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          "@ | Set-Content out/BUILD-PROVENANCE.txt -Encoding utf8
+
+          $lines = foreach ($file in Get-ChildItem out -File | Where-Object Extension -in ".zip",".exe") {
+            $hash = Get-FileHash $file.FullName -Algorithm SHA256
+            "$($hash.Hash.ToLowerInvariant()) *$($file.Name)"
+          }
+          $lines | Set-Content out/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload finished Windows build
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: Hiddify-Windows-safe-auto-connect-cli-fix
+          path: out
+          if-no-files-found: error
+          retention-days: 7
